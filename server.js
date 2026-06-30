@@ -1,110 +1,362 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server);
+
+app.use(express.static("public"));
+
 const PORT = process.env.PORT || 3000;
+const rooms = {};
 
-app.use(express.static('public'));
+const suits = ["♥", "♦", "♣", "♠"];
+const values = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
 
-const rooms = new Map();
-
-const suits = [
-  { id: 'hearts', name: 'Coeur', sym: '♥', color: 'red' },
-  { id: 'diamonds', name: 'Carreau', sym: '♦', color: 'red' },
-  { id: 'clubs', name: 'Trèfle', sym: '♣', color: 'black' },
-  { id: 'spades', name: 'Pique', sym: '♠', color: 'black' },
-];
-const ranks = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
-const rankValue = { A: 1, J: 11, Q: 12, K: 13 };
-for (let i=2;i<=10;i++) rankValue[String(i)] = i;
-
-function newDeck(){
+function makeDeck() {
   const deck = [];
-  for (const s of suits) for (const r of ranks) deck.push({ id: `${r}-${s.id}`, rank: r, suit: s.id, suitName: s.name, sym: s.sym, color: s.color, value: rankValue[r] });
-  for (let i=deck.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [deck[i],deck[j]]=[deck[j],deck[i]]; }
-  return deck;
+  for (const suit of suits) {
+    for (const value of values) {
+      deck.push({
+        value,
+        suit,
+        color: suit === "♥" || suit === "♦" ? "red" : "black"
+      });
+    }
+  }
+  return shuffle(deck);
 }
-function code(){ return Math.random().toString(36).slice(2,8).toUpperCase(); }
-function safeRoom(room, viewerId){
+
+function shuffle(deck) {
+  return deck.sort(() => Math.random() - 0.5);
+}
+
+function codeRoom() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function publicRoom(room, socketId = null) {
+  const me = room.players.find(p => p.id === socketId);
+
   return {
     code: room.code,
     hostId: room.hostId,
     phase: room.phase,
+    currentDealPlayer: room.currentDealPlayer,
+    currentDealStep: room.currentDealStep,
     currentPyramidIndex: room.currentPyramidIndex,
+    currentPyramidCard: room.currentPyramidCard,
     currentPenalty: room.currentPenalty,
-    pendingClaim: room.pendingClaim,
-    players: room.players.map(p => ({ id:p.id, name:p.name, connected:p.connected, cards: p.id===viewerId ? p.cards : p.cards.map(c => ({ hidden:true })), cardCount:p.cards.length })),
-    pyramid: room.pyramid.map((c, i) => i < room.currentPyramidIndex ? c : { hidden:true, row:c.row, penalty:c.penalty }),
-    log: room.log.slice(-30),
+    log: room.log.slice(-40),
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      isHost: p.id === room.hostId,
+      cardCount: p.hand.length,
+      drinks: p.drinks,
+      hand: p.id === socketId && room.phase !== "pyramid_locked" ? p.hand : null
+    })),
+    myHand: me ? me.hand : [],
+    pyramid: room.pyramid.map((card, index) => ({
+      index,
+      revealed: card.revealed,
+      value: card.revealed ? card.value : "?",
+      suit: card.revealed ? card.suit : "?",
+      color: card.revealed ? card.color : "hidden",
+      penalty: card.penalty
+    }))
   };
 }
-function emitRoom(room){
-  for (const p of room.players) io.to(p.id).emit('state', safeRoom(room, p.id));
-}
-function log(room, msg){ room.log.push({ t: new Date().toLocaleTimeString('fr-FR',{hour:'2-digit',minute:'2-digit'}), msg }); }
-function getRoomBySocket(id){ for (const r of rooms.values()) if (r.players.some(p=>p.id===id)) return r; return null; }
-function draw(room){ if (room.deck.length===0) room.deck = newDeck(); return room.deck.pop(); }
-function buildPyramid(deck){
-  const pyramid=[];
-  for (let row=1; row<=6; row++) {
-    for (let col=0; col<row; col++) pyramid.push({ ...deck.pop(), row, penalty: row===6 ? 'CUL SEC' : `${row} gorgée${row>1?'s':''}` });
+
+function emitRoom(room) {
+  for (const p of room.players) {
+    io.to(p.id).emit("state", publicRoom(room, p.id));
   }
-  return pyramid;
 }
 
-io.on('connection', socket => {
-  socket.on('createRoom', ({ name }) => {
-    const c = code();
-    const room = { code:c, hostId:socket.id, phase:'lobby', players:[{id:socket.id, name:(name||'Joueur').slice(0,18), connected:true, cards:[]}], deck:[], pyramid:[], currentPyramidIndex:0, currentPenalty:null, pendingClaim:null, log:[] };
-    rooms.set(c, room); socket.join(c); log(room, `${room.players[0].name} a créé la partie.`); emitRoom(room);
+function addLog(room, text) {
+  room.log.push(text);
+}
+
+function dealCard(room) {
+  if (room.deck.length === 0) room.deck = makeDeck();
+  return room.deck.pop();
+}
+
+function buildPyramid(room) {
+  const rows = [
+    { count: 6, penalty: 1 },
+    { count: 5, penalty: 2 },
+    { count: 4, penalty: 3 },
+    { count: 3, penalty: 4 },
+    { count: 2, penalty: 5 },
+    { count: 1, penalty: "CUL SEC" }
+  ];
+
+  room.pyramid = [];
+  for (const row of rows) {
+    for (let i = 0; i < row.count; i++) {
+      const card = dealCard(room);
+      room.pyramid.push({ ...card, revealed: false, penalty: row.penalty });
+    }
+  }
+}
+
+function stepName(step) {
+  return ["Rouge ou Noir", "Plus ou Moins", "Intérieur ou Extérieur", "Symbole"][step];
+}
+
+function cardText(card) {
+  return `${card.value}${card.suit}`;
+}
+
+function nextDeal(room) {
+  const player = room.players[room.currentDealPlayer];
+
+  if (player.hand.length >= 4) {
+    room.currentDealPlayer++;
+    room.currentDealStep = 0;
+  }
+
+  if (room.currentDealPlayer >= room.players.length) {
+    buildPyramid(room);
+    room.phase = "pyramid_locked";
+    addLog(room, "La pyramide est posée. Les cartes sont maintenant cachées.");
+    return;
+  }
+
+  addLog(room, `Au tour de ${room.players[room.currentDealPlayer].name} : ${stepName(room.currentDealStep)}.`);
+}
+
+function compareValue(a, b) {
+  return values.indexOf(a) - values.indexOf(b);
+}
+
+function checkDealGuess(player, step, guess, card) {
+  if (step === 0) return guess === card.color;
+  if (step === 1) {
+    const previous = player.hand[0];
+    if (guess === "plus") return compareValue(card.value, previous.value) > 0;
+    if (guess === "moins") return compareValue(card.value, previous.value) < 0;
+  }
+  if (step === 2) {
+    const a = values.indexOf(player.hand[0].value);
+    const b = values.indexOf(player.hand[1].value);
+    const c = values.indexOf(card.value);
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+    if (guess === "interieur") return c > min && c < max;
+    if (guess === "exterieur") return c < min || c > max;
+  }
+  if (step === 3) return guess === card.suit;
+  return false;
+}
+
+io.on("connection", socket => {
+  socket.on("createRoom", name => {
+    const code = codeRoom();
+    rooms[code] = {
+      code,
+      hostId: socket.id,
+      phase: "lobby",
+      deck: makeDeck(),
+      players: [{ id: socket.id, name, hand: [], drinks: 0 }],
+      pyramid: [],
+      currentDealPlayer: 0,
+      currentDealStep: 0,
+      currentPyramidIndex: -1,
+      currentPyramidCard: null,
+      currentPenalty: null,
+      log: [`${name} a créé la partie.`]
+    };
+    socket.join(code);
+    emitRoom(rooms[code]);
   });
-  socket.on('joinRoom', ({ roomCode, name }) => {
-    const room = rooms.get((roomCode||'').toUpperCase());
-    if (!room) return socket.emit('errorMsg','Salon introuvable.');
-    if (room.phase !== 'lobby') return socket.emit('errorMsg','La partie a déjà commencé.');
-    if (room.players.length >= 6) return socket.emit('errorMsg','Salon complet.');
-    room.players.push({id:socket.id, name:(name||'Joueur').slice(0,18), connected:true, cards:[]}); socket.join(room.code); log(room, `${name||'Un joueur'} a rejoint.`); emitRoom(room);
+
+  socket.on("joinRoom", ({ code, name }) => {
+    code = code.toUpperCase();
+    const room = rooms[code];
+    if (!room) return socket.emit("errorMsg", "Salon introuvable.");
+    if (room.players.length >= 6) return socket.emit("errorMsg", "Salon complet.");
+    if (room.phase !== "lobby") return socket.emit("errorMsg", "Partie déjà commencée.");
+
+    room.players.push({ id: socket.id, name, hand: [], drinks: 0 });
+    socket.join(code);
+    addLog(room, `${name} a rejoint la partie.`);
+    emitRoom(room);
   });
-  socket.on('startGame', () => {
-    const room = getRoomBySocket(socket.id); if (!room || room.hostId!==socket.id) return;
-    if (room.players.length < 2 || room.players.length > 6) return socket.emit('errorMsg','Il faut 2 à 6 joueurs.');
-    room.deck = newDeck(); room.pyramid = buildPyramid(room.deck); room.currentPyramidIndex=0; room.pendingClaim=null; room.currentPenalty=null;
-    for (const p of room.players) p.cards = [draw(room), draw(room), draw(room), draw(room)];
-    room.phase='playing'; log(room, 'La partie commence. Chaque joueur reçoit 4 cartes. La pyramide est posée.'); emitRoom(room);
+
+  socket.on("startGame", code => {
+    const room = rooms[code];
+    if (!room || socket.id !== room.hostId) return;
+    if (room.players.length < 2) return socket.emit("errorMsg", "Il faut au moins 2 joueurs.");
+
+    room.phase = "deal";
+    room.currentDealPlayer = 0;
+    room.currentDealStep = 0;
+    addLog(room, "Distribution commencée.");
+    nextDeal(room);
+    emitRoom(room);
   });
-  socket.on('peekCards', () => { const room=getRoomBySocket(socket.id); if(!room)return; const p=room.players.find(x=>x.id===socket.id); log(room, `${p.name} regarde ses cartes : pénalité 1 gorgée.`); emitRoom(room); });
-  socket.on('revealNext', () => {
-    const room=getRoomBySocket(socket.id); if(!room || room.hostId!==socket.id || room.phase!=='playing') return;
-    if (room.pendingClaim) return socket.emit('errorMsg','Termine le défi menteur avant.');
-    if (room.currentPyramidIndex>=room.pyramid.length){ room.phase='finished'; log(room,'Pyramide terminée.'); emitRoom(room); return; }
-    const card=room.pyramid[room.currentPyramidIndex]; room.currentPyramidIndex++; room.currentPenalty=card.penalty;
-    log(room, `Carte révélée : ${card.rank}${card.sym} — pénalité : ${card.penalty}.`); emitRoom(room);
+
+  socket.on("dealGuess", ({ code, guess, targetId }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== "deal") return;
+
+    const player = room.players[room.currentDealPlayer];
+    if (!player || player.id !== socket.id) return;
+
+    const card = dealCard(room);
+    const step = room.currentDealStep;
+    const penalty = step + 1;
+    const good = checkDealGuess(player, step, guess, card);
+
+    player.hand.push(card);
+
+    if (good) {
+      const target = room.players.find(p => p.id === targetId);
+      if (target) {
+        target.drinks += penalty;
+        addLog(room, `${player.name} a eu bon (${cardText(card)}) et donne ${penalty} gorgée(s) à ${target.name}.`);
+      } else {
+        addLog(room, `${player.name} a eu bon (${cardText(card)}).`);
+      }
+    } else {
+      player.drinks += penalty;
+      addLog(room, `${player.name} s'est trompé (${cardText(card)}) et boit ${penalty} gorgée(s).`);
+    }
+
+    room.currentDealStep++;
+    nextDeal(room);
+    emitRoom(room);
   });
-  socket.on('claim', ({ targetId, cardIndex }) => {
-    const room=getRoomBySocket(socket.id); if(!room || room.phase!=='playing' || room.pendingClaim) return;
-    const source=room.players.find(p=>p.id===socket.id); const target=room.players.find(p=>p.id===targetId);
-    const card=source?.cards[cardIndex]; const pyramidCard=room.pyramid[room.currentPyramidIndex-1];
-    if(!source || !target || !card || !pyramidCard) return;
-    room.pendingClaim={ sourceId:socket.id, sourceName:source.name, targetId, targetName:target.name, cardIndex, rank:pyramidCard.rank, penalty:pyramidCard.penalty };
-    log(room, `${source.name} distribue ${pyramidCard.penalty} à ${target.name} en annonçant ${pyramidCard.rank}.`); emitRoom(room);
+
+  socket.on("revealNextPyramid", code => {
+    const room = rooms[code];
+    if (!room || socket.id !== room.hostId) return;
+    if (room.phase !== "pyramid_locked") return;
+
+    room.currentPyramidIndex++;
+    if (room.currentPyramidIndex >= room.pyramid.length) {
+      room.phase = "finished";
+      addLog(room, "Partie terminée.");
+      emitRoom(room);
+      return;
+    }
+
+    const card = room.pyramid[room.currentPyramidIndex];
+    card.revealed = true;
+    room.currentPyramidCard = card;
+    room.currentPenalty = card.penalty;
+
+    addLog(room, `Carte révélée : ${cardText(card)} — ${card.penalty}.`);
+    emitRoom(room);
   });
-  socket.on('acceptClaim', () => {
-    const room=getRoomBySocket(socket.id); if(!room || !room.pendingClaim || room.pendingClaim.targetId!==socket.id) return;
-    log(room, `${room.pendingClaim.targetName} accepte la pénalité : ${room.pendingClaim.penalty}.`); room.pendingClaim=null; emitRoom(room);
+
+  socket.on("givePenalty", ({ code, targetId }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== "pyramid_locked") return;
+    if (!room.currentPyramidCard) return;
+
+    const giver = room.players.find(p => p.id === socket.id);
+    const target = room.players.find(p => p.id === targetId);
+    if (!giver || !target || giver.id === target.id) return;
+
+    room.pendingChallenge = {
+      giverId: giver.id,
+      targetId: target.id,
+      value: room.currentPyramidCard.value,
+      penalty: room.currentPenalty
+    };
+
+    addLog(room, `${giver.name} donne ${room.currentPenalty} à ${target.name}. ${target.name} peut accepter ou dire MENTEUR.`);
+    emitRoom(room);
   });
-  socket.on('callLiar', () => {
-    const room=getRoomBySocket(socket.id); if(!room || !room.pendingClaim || room.pendingClaim.targetId!==socket.id) return;
-    const claim=room.pendingClaim; const source=room.players.find(p=>p.id===claim.sourceId); const shown=source.cards[claim.cardIndex];
-    const ok = shown && shown.rank === claim.rank;
-    source.cards[claim.cardIndex] = draw(room);
-    if (ok) log(room, `MENTEUR ! ${source.name} montre ${shown.rank}${shown.sym}. Il disait vrai : ${claim.targetName} prend la pénalité doublée et ${source.name} repioche.`);
-    else log(room, `MENTEUR ! ${source.name} montre ${shown.rank}${shown.sym}. Il mentait : ${source.name} prend la pénalité doublée et repioche.`);
-    room.pendingClaim=null; emitRoom(room);
+
+  socket.on("acceptPenalty", code => {
+    const room = rooms[code];
+    if (!room || !room.pendingChallenge) return;
+
+    const challenge = room.pendingChallenge;
+    if (challenge.targetId !== socket.id) return;
+
+    const target = room.players.find(p => p.id === challenge.targetId);
+    target.drinks += challenge.penalty === "CUL SEC" ? 10 : challenge.penalty;
+
+    addLog(room, `${target.name} accepte et boit ${challenge.penalty}.`);
+    room.pendingChallenge = null;
+    emitRoom(room);
   });
-  socket.on('disconnect', () => { const room=getRoomBySocket(socket.id); if(!room)return; const p=room.players.find(x=>x.id===socket.id); p.connected=false; log(room, `${p.name} s'est déconnecté.`); emitRoom(room); });
+
+  socket.on("challengeLiar", ({ code, cardIndex }) => {
+    const room = rooms[code];
+    if (!room || !room.pendingChallenge) return;
+
+    const challenge = room.pendingChallenge;
+    if (challenge.targetId !== socket.id) return;
+
+    const giver = room.players.find(p => p.id === challenge.giverId);
+    const target = room.players.find(p => p.id === challenge.targetId);
+    const shown = giver.hand[cardIndex];
+
+    if (!shown) return;
+
+    const doublePenalty = challenge.penalty === "CUL SEC" ? "DOUBLE CUL SEC" : challenge.penalty * 2;
+    const numeric = challenge.penalty === "CUL SEC" ? 20 : challenge.penalty * 2;
+
+    if (shown.value === challenge.value) {
+      target.drinks += numeric;
+      giver.hand[cardIndex] = dealCard(room);
+      addLog(room, `${giver.name} montre ${cardText(shown)}. Il avait raison. ${target.name} boit ${doublePenalty}. Carte échangée.`);
+    } else {
+      giver.drinks += numeric;
+      addLog(room, `${giver.name} montre ${cardText(shown)}. Menteur ! ${giver.name} boit ${doublePenalty}.`);
+    }
+
+    room.pendingChallenge = null;
+    emitRoom(room);
+  });
+
+  socket.on("lookCard", ({ code, cardIndex }) => {
+    const room = rooms[code];
+    if (!room) return;
+
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player || !player.hand[cardIndex]) return;
+
+    if (room.phase === "pyramid_locked") {
+      player.drinks += 1;
+      addLog(room, `${player.name} regarde une carte et prend 1 gorgée.`);
+    }
+
+    socket.emit("privateCard", {
+      index: cardIndex,
+      card: player.hand[cardIndex]
+    });
+
+    emitRoom(room);
+  });
+
+  socket.on("disconnect", () => {
+    for (const code in rooms) {
+      const room = rooms[code];
+      const player = room.players.find(p => p.id === socket.id);
+      if (!player) continue;
+
+      room.players = room.players.filter(p => p.id !== socket.id);
+      addLog(room, `${player.name} a quitté la partie.`);
+
+      if (room.players.length === 0) {
+        delete rooms[code];
+      } else {
+        if (room.hostId === socket.id) room.hostId = room.players[0].id;
+        emitRoom(room);
+      }
+    }
+  });
 });
 
-server.listen(PORT, () => console.log(`Pyramide en ligne sur port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Pyramide lancée sur le port ${PORT}`);
+});
