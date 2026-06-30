@@ -1,0 +1,7 @@
+<!doctype html><html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>La Pyramide Online</title><link rel="stylesheet" href="style.css"></head><body>
+<div id="app"><header><h1>🍺 La Pyramide</h1><p>Jeu en ligne 2 à 6 joueurs — jokers retirés</p></header>
+<section id="home" class="panel"><input id="name" placeholder="Ton prénom" maxlength="18"><button id="create">Créer une partie</button><div class="join"><input id="room" placeholder="Code salon"><button id="join">Rejoindre</button></div><p id="err" class="err"></p></section>
+<section id="game" class="hidden"><div class="top panel"><div><b>Salon :</b> <span id="code"></span></div><div><button id="start">Démarrer</button><button id="next">Révéler carte suivante</button></div></div>
+<div id="pending" class="panel hidden"></div>
+<div class="grid"><div class="panel"><h2>Joueurs</h2><div id="players"></div></div><div class="panel"><h2>Pyramide</h2><div id="pyramid"></div></div><div class="panel"><h2>Mes cartes</h2><button id="peek">Regarder mes cartes (+1 gorgée)</button><div id="hand"></div><h2>Journal</h2><div id="log"></div></div></div></section></div>
+<script src="/socket.io/socket.io.js"></script><script src="app.js"></script></body></html>
